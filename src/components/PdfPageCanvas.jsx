@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback, memo } from 'react';
-import { Trash2 } from 'lucide-react';
+import { Trash2, Minus, Plus } from 'lucide-react';
 import PostItWidget from './PostItWidget';
 import { TextAnnotationWidget, StampAnnotationWidget } from './PageOverlayWidgets';
 import { POSTIT_COLORS, STAMP_TYPES } from '../constants/studyTools';
@@ -14,6 +14,29 @@ function pointsToSvgPath(points) {
   return points
     .map((pt, idx) => `${idx === 0 ? 'M' : 'L'} ${(pt.x * 1000).toFixed(1)} ${(pt.y * 1000).toFixed(1)}`)
     .join(' ');
+}
+
+// Compute bounding rect in 0..1000 SVG space for a rectilinear/multiline highlight
+function getHighlightRect(ann) {
+  const pts = ann.points || [];
+  if (pts.length < 2) return null;
+  const p0 = pts[0];
+  const p1 = pts[pts.length - 1];
+  const thickness = ann.strokeWidth || 0.014;
+
+  const minX = Math.min(p0.x, p1.x);
+  const maxX = Math.max(p0.x, p1.x);
+  const minY = Math.min(p0.y, p1.y) - thickness / 2;
+  const maxY = Math.max(p0.y, p1.y) + thickness / 2;
+
+  return {
+    x: minX * 1000,
+    y: minY * 1000,
+    width: Math.max(6, (maxX - minX) * 1000),
+    height: Math.max(thickness * 1000, (maxY - minY) * 1000),
+    p0,
+    p1,
+  };
 }
 
 const PdfPageCanvas = memo(function PdfPageCanvas({
@@ -37,18 +60,18 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   const renderTaskRef = useRef(null);
   const textItemsRef = useRef([]);
 
-  // Base A4 aspect ratio fallback before page loads so scrollbar is always accurate
   const [baseSize, setBaseSize] = useState({ width: 595.28, height: 841.89 });
   const [isNearViewport, setIsNearViewport] = useState(pageNumber <= 3);
   const [draftStroke, setDraftStroke] = useState(null);
   const [isErasing, setIsErasing] = useState(false);
+  // Handle resizing an existing highlight's start or end point (to shrink it or pull down to next line)
+  const [resizingHandle, setResizingHandle] = useState(null); // { annId, which: 'start' | 'end' }
 
   const dimensions = {
     width: Math.round(baseSize.width * zoom),
     height: Math.round(baseSize.height * zoom),
   };
 
-  // 1. Observe visibility for: (a) lazy rendering buffer (1400px), and (b) active page indicator
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -82,7 +105,6 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     };
   }, [pageNumber, onPageVisible]);
 
-  // 2. Render PDF page ONLY when near the viewport (keeps huge PDFs 100% smooth & low-memory)
   useEffect(() => {
     if (!isNearViewport || !pdfDoc) return;
     let cancelled = false;
@@ -127,7 +149,6 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         renderTaskRef.current = task;
         await task.promise;
 
-        // Extract text items once per page for highlight snippet capture
         if (textItemsRef.current.length === 0 && !cancelled) {
           const textContent = await page.getTextContent();
           if (!cancelled && textContent?.items) {
@@ -271,13 +292,15 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         ) ||
         customHighlighters?.[0] || { hex: '#FDE047', tag: 'Importante' };
 
+      const mode = toolOptions.highlightMode || 'multiline';
+
       setDraftStroke({
         type: 'highlight',
+        mode,
         color: toolOptions.highlightColor || activeHl.hex,
         tag: toolOptions.studyTag || activeHl.tag,
         opacity: 0.42,
-        strokeWidth: toolOptions.highlightThickness || 0.022,
-        straight: toolOptions.highlightStraight !== false || e.shiftKey,
+        strokeWidth: toolOptions.highlightThickness || 0.014,
         points: [pt, pt],
       });
       return;
@@ -294,14 +317,32 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   };
 
   const handleMouseMove = (e) => {
+    // 1. If dragging a resize handle of an existing highlight (to shrink it or pull down to next line)
+    if (resizingHandle) {
+      const pt = getNormalizedCoords(e.clientX, e.clientY);
+      const targetAnn = annotations.find((a) => a.id === resizingHandle.annId);
+      if (targetAnn && targetAnn.points?.length >= 2) {
+        const p0 = targetAnn.points[0];
+        const p1 = targetAnn.points[targetAnn.points.length - 1];
+        const nextPoints =
+          resizingHandle.which === 'start' ? [pt, p1] : [p0, pt];
+        onUpdateAnnotation(resizingHandle.annId, { points: nextPoints }, false);
+      }
+      return;
+    }
+
+    // 2. If drawing a new highlight or pen stroke
     if (!draftStroke) return;
     const pt = getNormalizedCoords(e.clientX, e.clientY);
 
-    if (draftStroke.type === 'highlight' && (draftStroke.straight || e.shiftKey)) {
+    if (draftStroke.type === 'highlight' && draftStroke.mode !== 'free') {
       const startPt = draftStroke.points[0];
+      // If user stays roughly on the same line, snap Y smoothly; if they drag down/up to another line, allow Y to go to the line below!
+      const dy = Math.abs(pt.y - startPt.y);
+      const targetY = dy < 0.009 ? startPt.y : pt.y;
       setDraftStroke((prev) => ({
         ...prev,
-        points: [startPt, { x: pt.x, y: startPt.y }],
+        points: [startPt, { x: pt.x, y: targetY }],
       }));
     } else {
       setDraftStroke((prev) => ({
@@ -312,6 +353,15 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   };
 
   const finishStroke = () => {
+    if (resizingHandle) {
+      const targetAnn = annotations.find((a) => a.id === resizingHandle.annId);
+      if (targetAnn) {
+        onUpdateAnnotation(resizingHandle.annId, { points: targetAnn.points }, true);
+      }
+      setResizingHandle(null);
+      return;
+    }
+
     if (isErasing) {
       setIsErasing(false);
     }
@@ -323,16 +373,17 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       const dy = pts[pts.length - 1].y - pts[0].y;
       const dist = Math.hypot(dx, dy);
 
-      if (dist > 0.008) {
+      if (dist > 0.006) {
         const snippet =
           draftStroke.type === 'highlight' ? extractHighlightedSnippet(pts) : '';
 
         onCreateAnnotation({
           page: pageNumber,
           type: draftStroke.type,
+          mode: draftStroke.mode || 'multiline',
           color: draftStroke.color,
           tag: draftStroke.tag || 'Marca-texto',
-          opacity: draftStroke.opacity || 1,
+          opacity: draftStroke.opacity || 0.42,
           strokeWidth: draftStroke.strokeWidth,
           points: pts,
           label:
@@ -380,7 +431,6 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       onMouseLeave={finishStroke}
       className={`relative bg-white shadow-page rounded-xl select-none mx-auto mb-7 border border-violet-100/70 ${cursorClass}`}
     >
-      {/* Subtle Page Number Badge */}
       <span className="absolute top-2.5 right-3 z-10 text-[10px] font-medium text-zinc-400 bg-zinc-100/80 px-2 py-0.5 rounded-full pointer-events-none">
         Pág. {pageNumber}
       </span>
@@ -404,7 +454,98 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
               const isSelected = ann.id === selectedAnnotationId;
               const isFlashing = ann.id === flashingAnnotationId;
               const strokeWidthSvg =
-                (ann.strokeWidth || (isHighlight ? 0.022 : 0.003)) * 1000;
+                (ann.strokeWidth || (isHighlight ? 0.014 : 0.003)) * 1000;
+
+              // Check if this is a 2-point rect/multiline highlight vs freehand path
+              const isBoxHighlight =
+                isHighlight &&
+                ann.mode !== 'free' &&
+                ann.points &&
+                ann.points.length === 2;
+
+              if (isBoxHighlight) {
+                const rect = getHighlightRect(ann);
+                if (!rect) return null;
+
+                return (
+                  <g key={ann.id}>
+                    {isSelected && (
+                      <rect
+                        x={rect.x - 2}
+                        y={rect.y - 2}
+                        width={rect.width + 4}
+                        height={rect.height + 4}
+                        rx={4}
+                        fill="none"
+                        stroke="#7C3AED"
+                        strokeWidth={2.5}
+                      />
+                    )}
+                    <rect
+                      x={rect.x}
+                      y={rect.y}
+                      width={rect.width}
+                      height={rect.height}
+                      rx={3}
+                      fill={ann.color || '#FDE047'}
+                      opacity={ann.opacity || 0.42}
+                      style={{
+                        mixBlendMode: 'multiply',
+                        pointerEvents: 'all',
+                        cursor: 'pointer',
+                      }}
+                      className={isFlashing ? 'animate-pulse' : ''}
+                      onMouseEnter={() => {
+                        if (activeTool === 'eraser' && isErasing) {
+                          onDeleteAnnotation(ann.id);
+                        }
+                      }}
+                      onMouseDown={(e) => {
+                        e.stopPropagation();
+                        if (activeTool === 'eraser') {
+                          onDeleteAnnotation(ann.id);
+                        } else {
+                          onSelectAnnotation(ann.id);
+                        }
+                      }}
+                    />
+
+                    {/* Draggable Resize Handles when Selected: Shrink or Pull down to next line! */}
+                    {isSelected && (
+                      <>
+                        {/* Start Handle (Left / Top-Left) */}
+                        <circle
+                          cx={rect.p0.x * 1000}
+                          cy={rect.p0.y * 1000}
+                          r={7}
+                          fill="#7C3AED"
+                          stroke="#FFFFFF"
+                          strokeWidth={2}
+                          style={{ pointerEvents: 'all', cursor: 'nwse-resize' }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            setResizingHandle({ annId: ann.id, which: 'start' });
+                          }}
+                        />
+                        {/* End Handle (Right / Bottom-Right) */}
+                        <circle
+                          cx={rect.p1.x * 1000}
+                          cy={rect.p1.y * 1000}
+                          r={7}
+                          fill="#7C3AED"
+                          stroke="#FFFFFF"
+                          strokeWidth={2}
+                          style={{ pointerEvents: 'all', cursor: 'nwse-resize' }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            setResizingHandle({ annId: ann.id, which: 'end' });
+                          }}
+                        />
+                      </>
+                    )}
+                  </g>
+                );
+              }
 
               return (
                 <g key={ann.id}>
@@ -414,7 +555,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                       fill="none"
                       stroke="#7C3AED"
                       strokeWidth={strokeWidthSvg + 5}
-                      strokeLinecap={isHighlight ? 'butt' : 'round'}
+                      strokeLinecap={isHighlight ? 'round' : 'round'}
                       strokeLinejoin="round"
                       opacity={0.4}
                     />
@@ -424,7 +565,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                     fill="none"
                     stroke={ann.color || '#FDE047'}
                     strokeWidth={strokeWidthSvg}
-                    strokeLinecap={isHighlight ? 'butt' : 'round'}
+                    strokeLinecap={isHighlight ? 'round' : 'round'}
                     strokeLinejoin="round"
                     opacity={isHighlight ? ann.opacity || 0.42 : 0.92}
                     style={{
@@ -451,35 +592,97 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
               );
             })}
 
-            {draftStroke && (
-              <path
-                d={pointsToSvgPath(draftStroke.points)}
-                fill="none"
-                stroke={draftStroke.color}
-                strokeWidth={draftStroke.strokeWidth * 1000}
-                strokeLinecap={draftStroke.type === 'highlight' ? 'butt' : 'round'}
-                strokeLinejoin="round"
-                opacity={draftStroke.type === 'highlight' ? 0.42 : 0.9}
-                style={{
-                  mixBlendMode: draftStroke.type === 'highlight' ? 'multiply' : 'normal',
-                }}
-              />
-            )}
+            {/* Active Draft Stroke while dragging */}
+            {draftStroke &&
+              (draftStroke.type === 'highlight' &&
+              draftStroke.mode !== 'free' &&
+              draftStroke.points.length === 2 ? (
+                (() => {
+                  const r = getHighlightRect(draftStroke);
+                  if (!r) return null;
+                  return (
+                    <rect
+                      x={r.x}
+                      y={r.y}
+                      width={r.width}
+                      height={r.height}
+                      rx={3}
+                      fill={draftStroke.color}
+                      opacity={0.42}
+                      style={{ mixBlendMode: 'multiply' }}
+                    />
+                  );
+                })()
+              ) : (
+                <path
+                  d={pointsToSvgPath(draftStroke.points)}
+                  fill="none"
+                  stroke={draftStroke.color}
+                  strokeWidth={draftStroke.strokeWidth * 1000}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  opacity={draftStroke.type === 'highlight' ? 0.42 : 0.9}
+                  style={{
+                    mixBlendMode:
+                      draftStroke.type === 'highlight' ? 'multiply' : 'normal',
+                  }}
+                />
+              ))}
           </svg>
 
-          {/* Popover when a Highlight or Pen Stroke is clicked */}
+          {/* Popover when a Highlight or Pen Stroke is clicked: Shrink/Grow thickness, Change color, or Delete */}
           {selectedVector && (
             <div
               onMouseDown={(e) => e.stopPropagation()}
               style={{
-                left: `${Math.min(0.62, selectedVector.points?.[0]?.x || 0.2) * dimensions.width}px`,
-                top: `${Math.max(0.03, (selectedVector.points?.[0]?.y || 0.2) - 0.05) * dimensions.height}px`,
+                left: `${Math.min(0.55, selectedVector.points?.[0]?.x || 0.2) * dimensions.width}px`,
+                top: `${Math.max(0.02, (selectedVector.points?.[0]?.y || 0.2) - 0.055) * dimensions.height}px`,
               }}
               className="absolute z-50 flex items-center gap-2 bg-white text-zinc-800 px-3 py-1.5 rounded-2xl shadow-float border border-violet-100 text-xs"
             >
-              <span className="font-medium text-violet-900">
-                {selectedVector.tag || 'Marcação'}
-              </span>
+              {/* Shrink / Grow Thickness of this highlight */}
+              {selectedVector.type === 'highlight' && (
+                <div className="flex items-center gap-1 pr-1 border-r border-zinc-200">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateAnnotation(
+                        selectedVector.id,
+                        {
+                          strokeWidth: Math.max(
+                            0.006,
+                            +((selectedVector.strokeWidth || 0.014) - 0.003).toFixed(3)
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    className="p-1 rounded-lg bg-[#F5F4F9] hover:bg-violet-50 text-zinc-700"
+                    title="Diminuir altura do marca-texto"
+                  >
+                    <Minus className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateAnnotation(
+                        selectedVector.id,
+                        {
+                          strokeWidth: Math.min(
+                            0.045,
+                            +((selectedVector.strokeWidth || 0.014) + 0.003).toFixed(3)
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    className="p-1 rounded-lg bg-[#F5F4F9] hover:bg-violet-50 text-zinc-700"
+                    title="Aumentar altura do marca-texto"
+                  >
+                    <Plus className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
 
               {selectedVector.type === 'highlight' &&
                 (customHighlighters || []).map((hl) => (
