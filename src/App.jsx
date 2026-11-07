@@ -7,6 +7,14 @@ import FloatingStudyToolbar from './components/FloatingStudyToolbar';
 import PdfPageCanvas from './components/PdfPageCanvas';
 import QuickSearchModal from './components/QuickSearchModal';
 import { DEFAULT_CUSTOM_HIGHLIGHTERS } from './constants/studyTools';
+import {
+  idbGetDocuments,
+  idbSaveDocument,
+  idbGetFileBuffer,
+  idbGetAnnotations,
+  idbSaveAnnotations,
+  idbDeleteDocument,
+} from './utils/pdfStorage';
 import { Loader2, Upload } from 'lucide-react';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -62,53 +70,71 @@ export default function App() {
 
   const fetchDocumentsList = useCallback(async (preferredId = undefined) => {
     try {
-      const [docsRes, settingsRes] = await Promise.all([
-        fetch('/api/documents'),
-        fetch('/api/settings'),
-      ]);
+      // 1. Load documents stored in browser IndexedDB (works on Vercel & offline)
+      const localDocs = await idbGetDocuments();
+      const mapById = new Map();
+      localDocs.forEach((d) => mapById.set(d.id, d));
 
-      let serverLastId = null;
-      if (settingsRes.ok) {
-        const settingsJson = await settingsRes.json();
-        serverLastId = settingsJson.lastActiveDocId;
-        if (
-          Array.isArray(settingsJson.customHighlighters) &&
-          settingsJson.customHighlighters.length > 0
-        ) {
-          setCustomHighlighters(settingsJson.customHighlighters);
-          localStorage.setItem(
-            'papiro_custom_highlighters',
-            JSON.stringify(settingsJson.customHighlighters)
-          );
+      // 2. Also merge documents from backend API if running locally
+      try {
+        const [docsRes, settingsRes] = await Promise.all([
+          fetch('/api/documents'),
+          fetch('/api/settings'),
+        ]);
+        if (settingsRes.ok && !localStorage.getItem('papiro_custom_highlighters')) {
+          const settingsJson = await settingsRes.json();
+          if (
+            Array.isArray(settingsJson.customHighlighters) &&
+            settingsJson.customHighlighters.length > 0
+          ) {
+            setCustomHighlighters(settingsJson.customHighlighters);
+            localStorage.setItem(
+              'papiro_custom_highlighters',
+              JSON.stringify(settingsJson.customHighlighters)
+            );
+          }
         }
+        if (docsRes.ok) {
+          const contentType = docsRes.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const apiDocs = await docsRes.json();
+            if (Array.isArray(apiDocs)) {
+              apiDocs.forEach((d) => {
+                if (!mapById.has(d.id)) {
+                  mapById.set(d.id, d);
+                }
+              });
+            }
+          }
+        }
+      } catch (_apiErr) {
+        // Running on static Vercel deployment without Express server; IndexedDB handles everything
       }
 
-      if (docsRes.ok) {
-        const list = await docsRes.json();
-        setDocuments(list);
+      const combinedList = Array.from(mapById.values());
+      setDocuments(combinedList);
 
-        if (list.length === 0) {
-          setActiveDocId(null);
-          setActiveDocData(null);
-          setPdfDoc(null);
-          setAnnotations([]);
-          setIsLoadingPdf(false);
-          localStorage.removeItem('papiro_last_doc_id');
-          return;
-        }
+      if (combinedList.length === 0) {
+        setActiveDocId(null);
+        setActiveDocData(null);
+        setPdfDoc(null);
+        setAnnotations([]);
+        setIsLoadingPdf(false);
+        localStorage.removeItem('papiro_last_doc_id');
+        return;
+      }
 
-        const localLastId = localStorage.getItem('papiro_last_doc_id');
-        const targetId =
-          preferredId !== undefined
-            ? preferredId
-            : (localLastId && list.some((d) => d.id === localLastId) ? localLastId : null) ||
-              (serverLastId && list.some((d) => d.id === serverLastId) ? serverLastId : null) ||
-              list[0].id;
+      const localLastId = localStorage.getItem('papiro_last_doc_id');
+      const targetId =
+        preferredId !== undefined
+          ? preferredId
+          : (localLastId && combinedList.some((d) => d.id === localLastId)
+              ? localLastId
+              : null) || combinedList[0].id;
 
-        setActiveDocId(targetId);
-        if (targetId) {
-          localStorage.setItem('papiro_last_doc_id', targetId);
-        }
+      setActiveDocId(targetId);
+      if (targetId) {
+        localStorage.setItem('papiro_last_doc_id', targetId);
       }
     } catch (err) {
       console.error('Erro ao buscar documentos:', err);
@@ -133,12 +159,12 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ customHighlighters: nextHighlighters }),
       });
-    } catch (err) {
-      console.error('Erro ao salvar cores:', err);
+    } catch (_err) {
+      // Saved in localStorage
     }
   }, []);
 
-  // Load active PDF document via streaming URL (fast & low-memory for large PDFs)
+  // Load active PDF document & annotations (from IndexedDB first, fallback to API)
   useEffect(() => {
     if (!activeDocId) {
       setPdfDoc(null);
@@ -157,18 +183,45 @@ export default function App() {
       setSelectedAnnotationId(null);
       setUndoStack([]);
       try {
+        // 1. Check IndexedDB first
+        const localDocs = await idbGetDocuments();
+        const localMeta = localDocs.find((d) => d.id === activeDocId);
+        const localBuffer = await idbGetFileBuffer(activeDocId);
+        const localAnns = await idbGetAnnotations(activeDocId);
+        const cachedAnnsRaw = localStorage.getItem(`papiro_annotations_${activeDocId}`);
+        const cachedAnns = cachedAnnsRaw ? JSON.parse(cachedAnnsRaw) : null;
+
+        if (localMeta && localBuffer) {
+          if (cancelled) return;
+          setActiveDocData(localMeta);
+          const resolvedAnns =
+            localAnns.length > 0 ? localAnns : cachedAnns || [];
+          setAnnotations(resolvedAnns);
+          setCurrentPage(localMeta.currentPage || 1);
+
+          loadingTask = pdfjsLib.getDocument({ data: localBuffer.slice(0) });
+          const loadedPdf = await loadingTask.promise;
+          if (cancelled) return;
+
+          setPdfDoc(loadedPdf);
+          setPageCount(loadedPdf.numPages);
+          setIsLoadingPdf(false);
+          return;
+        }
+
+        // 2. Fallback to backend API
         const metaRes = await fetch(`/api/documents/${activeDocId}`);
         if (!metaRes.ok) throw new Error('Documento não encontrado');
         const docJson = await metaRes.json();
         if (cancelled) return;
 
         setActiveDocData(docJson);
-        const serverAnns = docJson.annotations || [];
+        const serverAnns =
+          cachedAnns && cachedAnns.length > 0
+            ? cachedAnns
+            : docJson.annotations || [];
         setAnnotations(serverAnns);
-        localStorage.setItem(
-          `papiro_annotations_${activeDocId}`,
-          JSON.stringify(serverAnns)
-        );
+        await idbSaveAnnotations(activeDocId, serverAnns);
         setCurrentPage(docJson.currentPage || 1);
 
         loadingTask = pdfjsLib.getDocument({
@@ -268,25 +321,37 @@ export default function App() {
     setUndoStack((prev) => [...prev.slice(-19), annotations]);
   }, [annotations]);
 
+  const persistAnnotationsEverywhere = useCallback(
+    async (docId, nextAnnotations) => {
+      if (!docId) return;
+      localStorage.setItem(
+        `papiro_annotations_${docId}`,
+        JSON.stringify(nextAnnotations)
+      );
+      try {
+        await idbSaveAnnotations(docId, nextAnnotations);
+      } catch (_e) {
+        // ignore
+      }
+      try {
+        await fetch(`/api/documents/${docId}/annotations`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ annotations: nextAnnotations }),
+        });
+      } catch (_e) {
+        // ignore when on static host
+      }
+    },
+    []
+  );
+
   const handleUndo = async () => {
     if (undoStack.length === 0 || !activeDocId) return;
     const previousAnnotations = undoStack[undoStack.length - 1];
     setUndoStack((prev) => prev.slice(0, -1));
     setAnnotations(previousAnnotations);
-    localStorage.setItem(
-      `papiro_annotations_${activeDocId}`,
-      JSON.stringify(previousAnnotations)
-    );
-
-    try {
-      await fetch(`/api/documents/${activeDocId}/annotations`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ annotations: previousAnnotations }),
-      });
-    } catch (err) {
-      console.error('Erro ao sincronizar undo:', err);
-    }
+    await persistAnnotationsEverywhere(activeDocId, previousAnnotations);
   };
 
   const handleCreateAnnotation = useCallback(
@@ -303,7 +368,7 @@ export default function App() {
 
       setAnnotations((prev) => {
         const next = [...prev, optimisticAnn];
-        localStorage.setItem(`papiro_annotations_${activeDocId}`, JSON.stringify(next));
+        persistAnnotationsEverywhere(activeDocId, next);
         return next;
       });
 
@@ -311,51 +376,21 @@ export default function App() {
         setSelectedAnnotationId(annId);
         setActiveTool('select');
       }
-
-      try {
-        const res = await fetch(`/api/documents/${activeDocId}/annotations`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(optimisticAnn),
-        });
-        if (res.ok) {
-          const saved = await res.json();
-          setAnnotations((prev) => {
-            const next = prev.map((a) => (a.id === annId ? saved : a));
-            localStorage.setItem(`papiro_annotations_${activeDocId}`, JSON.stringify(next));
-            return next;
-          });
-        }
-      } catch (err) {
-        console.error('Erro ao salvar anotação:', err);
-      }
     },
-    [activeDocId, pushUndoState]
+    [activeDocId, pushUndoState, persistAnnotationsEverywhere]
   );
 
   const handleUpdateAnnotation = useCallback(
     async (annId, patch, commit = true) => {
       setAnnotations((prev) => {
         const next = prev.map((a) => (a.id === annId ? { ...a, ...patch } : a));
-        if (activeDocId) {
-          localStorage.setItem(`papiro_annotations_${activeDocId}`, JSON.stringify(next));
+        if (commit && activeDocId) {
+          persistAnnotationsEverywhere(activeDocId, next);
         }
         return next;
       });
-
-      if (commit && activeDocId) {
-        try {
-          await fetch(`/api/documents/${activeDocId}/annotations/${annId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(patch),
-          });
-        } catch (err) {
-          console.error('Erro ao atualizar anotação:', err);
-        }
-      }
     },
-    [activeDocId]
+    [activeDocId, persistAnnotationsEverywhere]
   );
 
   const handleDeleteAnnotation = useCallback(
@@ -365,21 +400,13 @@ export default function App() {
 
       setAnnotations((prev) => {
         const next = prev.filter((a) => a.id !== annId);
-        localStorage.setItem(`papiro_annotations_${activeDocId}`, JSON.stringify(next));
+        persistAnnotationsEverywhere(activeDocId, next);
         return next;
       });
 
       setSelectedAnnotationId((prev) => (prev === annId ? null : prev));
-
-      try {
-        await fetch(`/api/documents/${activeDocId}/annotations/${annId}`, {
-          method: 'DELETE',
-        });
-      } catch (err) {
-        console.error('Erro ao excluir anotação:', err);
-      }
     },
-    [activeDocId, pushUndoState]
+    [activeDocId, pushUndoState, persistAnnotationsEverywhere]
   );
 
   const handleClearPageAnnotations = async () => {
@@ -388,40 +415,58 @@ export default function App() {
     const remaining = annotations.filter((a) => (a.page || 1) !== currentPage);
     setAnnotations(remaining);
     setSelectedAnnotationId(null);
-    localStorage.setItem(
-      `papiro_annotations_${activeDocId}`,
-      JSON.stringify(remaining)
-    );
-
-    try {
-      await fetch(`/api/documents/${activeDocId}/annotations`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ annotations: remaining }),
-      });
-    } catch (err) {
-      console.error('Erro ao limpar página:', err);
-    }
+    await persistAnnotationsEverywhere(activeDocId, remaining);
   };
 
+  // Upload PDF file: saves into IndexedDB (instant & unlimited size on Vercel) + syncs to API if local
   const handleUploadFile = async (file) => {
     if (!file) return;
     setIsUploading(true);
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('title', file.name.replace(/\.[^/.]+$/, ''));
+      const arrayBuffer = await file.arrayBuffer();
+      let detectedPages = 1;
+      try {
+        const tempTask = pdfjsLib.getDocument({ data: arrayBuffer.slice(0) });
+        const tempPdf = await tempTask.promise;
+        detectedPages = tempPdf.numPages;
+        tempTask.destroy();
+      } catch (_e) {
+        // ignore
+      }
 
-      const res = await fetch('/api/documents', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) throw new Error('Erro no upload');
-      const createdDoc = await res.json();
-      localStorage.setItem('papiro_last_doc_id', createdDoc.id);
-      await fetchDocumentsList(createdDoc.id);
+      const now = new Date().toISOString();
+      const docId = `doc-${Date.now()}`;
+      const newDocMeta = {
+        id: docId,
+        title: file.name.replace(/\.[^/.]+$/, ''),
+        filename: file.name,
+        pageCount: detectedPages,
+        currentPage: 1,
+        zoom: 1.15,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await idbSaveDocument(newDocMeta, arrayBuffer);
+      await idbSaveAnnotations(docId, []);
+      localStorage.setItem('papiro_last_doc_id', docId);
+
+      // Also sync to local backend if running
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('title', newDocMeta.title);
+        await fetch('/api/documents', {
+          method: 'POST',
+          body: formData,
+        });
+      } catch (_apiErr) {
+        // IndexedDB already saved the PDF
+      }
+
+      await fetchDocumentsList(docId);
     } catch (err) {
-      console.error('Falha ao enviar arquivo:', err);
+      console.error('Falha ao abrir arquivo:', err);
     } finally {
       setIsUploading(false);
     }
@@ -429,8 +474,13 @@ export default function App() {
 
   const handleDeleteDocument = async (docId) => {
     try {
-      await fetch(`/api/documents/${docId}`, { method: 'DELETE' });
+      await idbDeleteDocument(docId);
       localStorage.removeItem(`papiro_annotations_${docId}`);
+      try {
+        await fetch(`/api/documents/${docId}`, { method: 'DELETE' });
+      } catch (_e) {
+        // ignore
+      }
 
       const remaining = documents.filter((d) => d.id !== docId);
       setDocuments(remaining);
@@ -485,7 +535,7 @@ export default function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pdf,.txt,.md,application/pdf,text/plain"
+        accept=".pdf,application/pdf"
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) {
@@ -521,7 +571,6 @@ export default function App() {
         onToggleNotesDrawer={() => setShowNotesDrawer((v) => !v)}
       />
 
-      {/* Quick Search & Go-to-Page Modal (Ctrl + L) */}
       <QuickSearchModal
         isOpen={isSearchOpen}
         onClose={() => setIsSearchOpen(false)}
