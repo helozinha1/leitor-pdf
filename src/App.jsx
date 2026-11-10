@@ -58,7 +58,9 @@ export default function App() {
     postitColor: '#FEF9C3',
     inkColor: '#6D28D9',
     fontSize: 15,
-    penThickness: 0.0036,
+    penThickness: 0.0032,
+    penStraight: false,
+    penBeautify: false,
     stampType: 'check',
   });
 

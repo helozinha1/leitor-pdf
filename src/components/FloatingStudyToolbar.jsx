@@ -10,6 +10,8 @@ import {
   Plus,
   X,
   Minus,
+  Sparkles,
+  Ruler,
 } from 'lucide-react';
 import { POSTIT_COLORS, INK_COLORS, QUICK_COLOR_SWATCHES } from '../constants/studyTools';
 
@@ -87,7 +89,7 @@ export default function FloatingStudyToolbar({
 
   return (
     <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none max-w-[96vw]">
-      {/* MARCA-TEXTO: Cores, Nome, Tamanho e Modo (Livre / Bloco / Reto) */}
+      {/* MARCA-TEXTO: Cores, Nome, Tamanho e Modo */}
       {activeTool === 'highlight' && activeHighlighter && (
         <div className="pointer-events-auto flex flex-col gap-2 bg-white px-4 py-2.5 rounded-2xl shadow-float border border-violet-100">
           {/* Linha 1: Suas cores + Escolher Cor e Nome */}
@@ -173,9 +175,8 @@ export default function FloatingStudyToolbar({
             </div>
           </div>
 
-          {/* Linha 2: Diminuir/Aumentar Tamanho do Marca-texto + Modo (Ir até a linha de baixo) */}
+          {/* Linha 2: Diminuir/Aumentar Tamanho do Marca-texto + Modo */}
           <div className="flex flex-wrap items-center justify-center gap-3 pt-1 border-t border-violet-50 text-xs">
-            {/* Controle de Espessura / Tamanho */}
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] text-zinc-400">Tamanho:</span>
               <button
@@ -220,7 +221,6 @@ export default function FloatingStudyToolbar({
 
             <div className="h-4 w-px bg-zinc-200" />
 
-            {/* Modos: Reto / Várias linhas (Bloco) / Livre */}
             <div className="flex items-center gap-1 bg-[#F5F4F9] p-0.5 rounded-xl">
               {[
                 { id: 'multiline', label: 'Linha / Descer p/ Baixo' },
@@ -268,8 +268,8 @@ export default function FloatingStudyToolbar({
         </div>
       )}
 
-      {/* ESCREVER / CANETA Color Bar */}
-      {(activeTool === 'text' || activeTool === 'pen') && (
+      {/* ESCREVER (TEXTO) Options */}
+      {activeTool === 'text' && (
         <div className="pointer-events-auto flex items-center gap-2 bg-white px-3.5 py-2 rounded-2xl shadow-float border border-violet-100">
           <span className="text-xs text-zinc-400">Cor:</span>
           {INK_COLORS.map((c) => (
@@ -286,6 +286,96 @@ export default function FloatingStudyToolbar({
               title={c.name}
             />
           ))}
+        </div>
+      )}
+
+      {/* CANETA: Cores, Espessura e Funções Opcionais (Traço Reto / Arrumar Letra) */}
+      {activeTool === 'pen' && (
+        <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2.5 bg-white px-4 py-2 rounded-2xl shadow-float border border-violet-100">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-zinc-400 mr-0.5">Cor:</span>
+            {INK_COLORS.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => onChangeToolOptions({ inkColor: c.hex })}
+                style={{ backgroundColor: c.hex }}
+                className={`w-4 h-4 rounded-full transition-transform ${
+                  toolOptions.inkColor === c.hex
+                    ? 'scale-125 ring-2 ring-violet-600'
+                    : 'hover:scale-110'
+                }`}
+                title={c.name}
+              />
+            ))}
+          </div>
+
+          <div className="h-4 w-px bg-zinc-200" />
+
+          {/* Espessura da Caneta */}
+          <div className="flex items-center gap-1">
+            {[
+              { label: 'Fina', val: 0.0022 },
+              { label: 'Média', val: 0.0034 },
+              { label: 'Forte', val: 0.0052 },
+            ].map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => onChangeToolOptions({ penThickness: p.val })}
+                className={`px-2 py-1 rounded-lg text-[11px] font-medium transition ${
+                  (toolOptions.penThickness || 0.0032) === p.val
+                    ? 'bg-violet-100 text-violet-900 font-semibold'
+                    : 'text-zinc-500 hover:bg-[#F5F4F9]'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="h-4 w-px bg-zinc-200" />
+
+          {/* Botões Opcionais: Só funcionam quando ativados pelo usuário! */}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() =>
+                onChangeToolOptions({
+                  penStraight: !toolOptions.penStraight,
+                  penBeautify: false,
+                })
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-medium transition ${
+                toolOptions.penStraight
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'bg-[#F5F4F9] text-zinc-600 hover:bg-violet-50 hover:text-violet-900'
+              }`}
+              title="Ativar/Desativar traço reto automático"
+            >
+              <Ruler className="w-3.5 h-3.5" />
+              <span>Traço Reto</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                onChangeToolOptions({
+                  penBeautify: !toolOptions.penBeautify,
+                  penStraight: false,
+                })
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-medium transition ${
+                toolOptions.penBeautify
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'bg-[#F5F4F9] text-zinc-600 hover:bg-violet-50 hover:text-violet-900'
+              }`}
+              title="Ativar/Desativar: suaviza e arruma a letra automaticamente ao escrever"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Arrumar Letra</span>
+            </button>
+          </div>
         </div>
       )}
 

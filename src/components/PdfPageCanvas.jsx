@@ -1,22 +1,118 @@
 import React, { useEffect, useRef, useState, useCallback, memo } from 'react';
-import { Trash2, Minus, Plus } from 'lucide-react';
+import { Trash2, Minus, Plus, Ruler, Sparkles } from 'lucide-react';
 import PostItWidget from './PostItWidget';
 import { TextAnnotationWidget, StampAnnotationWidget } from './PageOverlayWidgets';
 import { POSTIT_COLORS, STAMP_TYPES } from '../constants/studyTools';
 
-function pointsToSvgPath(points) {
+// Render points as smooth Quadratic Bezier SVG path when smoothed, or standard polyline
+function pointsToSvgPath(points, useSmoothBezier = false) {
   if (!points || points.length === 0) return '';
   if (points.length === 1) {
     const x = (points[0].x * 1000).toFixed(1);
     const y = (points[0].y * 1000).toFixed(1);
     return `M ${x} ${y} L ${x} ${y}`;
   }
-  return points
-    .map((pt, idx) => `${idx === 0 ? 'M' : 'L'} ${(pt.x * 1000).toFixed(1)} ${(pt.y * 1000).toFixed(1)}`)
-    .join(' ');
+  if (!useSmoothBezier || points.length === 2) {
+    return points
+      .map(
+        (pt, idx) =>
+          `${idx === 0 ? 'M' : 'L'} ${(pt.x * 1000).toFixed(1)} ${(pt.y * 1000).toFixed(1)}`
+      )
+      .join(' ');
+  }
+
+  // Smooth Quadratic Bezier curve through midpoints for calligraphic handwriting
+  let d = `M ${(points[0].x * 1000).toFixed(1)} ${(points[0].y * 1000).toFixed(1)}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const curr = points[i];
+    const next = points[i + 1];
+    const midX = (((curr.x + next.x) / 2) * 1000).toFixed(1);
+    const midY = (((curr.y + next.y) / 2) * 1000).toFixed(1);
+    d += ` Q ${(curr.x * 1000).toFixed(1)} ${(curr.y * 1000).toFixed(1)}, ${midX} ${midY}`;
+  }
+  const last = points[points.length - 1];
+  d += ` L ${(last.x * 1000).toFixed(1)} ${(last.y * 1000).toFixed(1)}`;
+  return d;
 }
 
-// Compute bounding rect in 0..1000 SVG space for a rectilinear/multiline highlight
+// Snap a straight line to horizontal or vertical if nearly aligned
+function snapStraightEndpoints(startPt, endPt) {
+  const dx = endPt.x - startPt.x;
+  const dy = endPt.y - startPt.y;
+  const absDx = Math.abs(dx);
+  const absDy = Math.abs(dy);
+
+  if (absDx > 0.02 && absDy / absDx < 0.08) {
+    return [startPt, { x: endPt.x, y: startPt.y }];
+  }
+  if (absDy > 0.02 && absDx / absDy < 0.08) {
+    return [startPt, { x: startPt.x, y: endPt.y }];
+  }
+  return [startPt, endPt];
+}
+
+// Beautify / Smooth shaky mouse handwriting (Chaikin smoothing + straight-line detection)
+function beautifyStrokePoints(rawPoints) {
+  if (!rawPoints || rawPoints.length <= 2) return rawPoints;
+
+  // 1. Filter out tiny micro-jitter points from mouse movement
+  const filtered = [rawPoints[0]];
+  for (let i = 1; i < rawPoints.length; i++) {
+    const prev = filtered[filtered.length - 1];
+    const curr = rawPoints[i];
+    if (Math.hypot(curr.x - prev.x, curr.y - prev.y) >= 0.0025 || i === rawPoints.length - 1) {
+      filtered.push(curr);
+    }
+  }
+
+  if (filtered.length <= 2) {
+    return snapStraightEndpoints(filtered[0], filtered[filtered.length - 1]);
+  }
+
+  // 2. Check if the user intended a straight line (e.g. underline, fraction bar, stem)
+  const start = filtered[0];
+  const end = filtered[filtered.length - 1];
+  const chordLen = Math.hypot(end.x - start.x, end.y - start.y);
+
+  if (chordLen > 0.025) {
+    let maxDev = 0;
+    for (let i = 1; i < filtered.length - 1; i++) {
+      const p = filtered[i];
+      const num = Math.abs(
+        (end.y - start.y) * p.x - (end.x - start.x) * p.y + end.x * start.y - end.y * start.x
+      );
+      const dev = num / chordLen;
+      if (dev > maxDev) maxDev = dev;
+    }
+    if (maxDev / chordLen < 0.055) {
+      return snapStraightEndpoints(start, end);
+    }
+  }
+
+  // 3. Apply 2 passes of Chaikin's corner-cutting algorithm to round out shaky corners
+  let pts = filtered;
+  for (let pass = 0; pass < 2; pass++) {
+    if (pts.length < 3) break;
+    const next = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i];
+      const p1 = pts[i + 1];
+      next.push({
+        x: 0.75 * p0.x + 0.25 * p1.x,
+        y: 0.75 * p0.y + 0.25 * p1.y,
+      });
+      next.push({
+        x: 0.25 * p0.x + 0.75 * p1.x,
+        y: 0.25 * p0.y + 0.75 * p1.y,
+      });
+    }
+    next.push(pts[pts.length - 1]);
+    pts = next;
+  }
+
+  return pts;
+}
+
 function getHighlightRect(ann) {
   const pts = ann.points || [];
   if (pts.length < 2) return null;
@@ -64,8 +160,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   const [isNearViewport, setIsNearViewport] = useState(pageNumber <= 3);
   const [draftStroke, setDraftStroke] = useState(null);
   const [isErasing, setIsErasing] = useState(false);
-  // Handle resizing an existing highlight's start or end point (to shrink it or pull down to next line)
-  const [resizingHandle, setResizingHandle] = useState(null); // { annId, which: 'start' | 'end' }
+  const [resizingHandle, setResizingHandle] = useState(null);
 
   const dimensions = {
     width: Math.round(baseSize.width * zoom),
@@ -309,15 +404,16 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     if (activeTool === 'pen') {
       setDraftStroke({
         type: 'pen',
+        straight: !!toolOptions.penStraight,
+        beautify: !!toolOptions.penBeautify,
         color: toolOptions.inkColor || '#6D28D9',
-        strokeWidth: toolOptions.penThickness || 0.0036,
+        strokeWidth: toolOptions.penThickness || 0.0032,
         points: [pt],
       });
     }
   };
 
   const handleMouseMove = (e) => {
-    // 1. If dragging a resize handle of an existing highlight (to shrink it or pull down to next line)
     if (resizingHandle) {
       const pt = getNormalizedCoords(e.clientX, e.clientY);
       const targetAnn = annotations.find((a) => a.id === resizingHandle.annId);
@@ -331,25 +427,51 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       return;
     }
 
-    // 2. If drawing a new highlight or pen stroke
     if (!draftStroke) return;
     const pt = getNormalizedCoords(e.clientX, e.clientY);
 
     if (draftStroke.type === 'highlight' && draftStroke.mode !== 'free') {
       const startPt = draftStroke.points[0];
-      // If user stays roughly on the same line, snap Y smoothly; if they drag down/up to another line, allow Y to go to the line below!
       const dy = Math.abs(pt.y - startPt.y);
       const targetY = dy < 0.009 ? startPt.y : pt.y;
       setDraftStroke((prev) => ({
         ...prev,
         points: [startPt, { x: pt.x, y: targetY }],
       }));
-    } else {
+      return;
+    }
+
+    // Pen with "Traço Reto" activated (or holding Shift)
+    if (draftStroke.type === 'pen' && (draftStroke.straight || e.shiftKey)) {
+      const startPt = draftStroke.points[0];
+      const snapped = snapStraightEndpoints(startPt, pt);
       setDraftStroke((prev) => ({
         ...prev,
-        points: [...prev.points, pt],
+        points: snapped,
       }));
+      return;
     }
+
+    // Pen with "Arrumar Letra" activated: stabilize hand tremor in real-time
+    if (draftStroke.type === 'pen' && draftStroke.beautify) {
+      setDraftStroke((prev) => {
+        const last = prev.points[prev.points.length - 1];
+        const stabilized = {
+          x: last.x * 0.45 + pt.x * 0.55,
+          y: last.y * 0.45 + pt.y * 0.55,
+        };
+        return {
+          ...prev,
+          points: [...prev.points, stabilized],
+        };
+      });
+      return;
+    }
+
+    setDraftStroke((prev) => ({
+      ...prev,
+      points: [...prev.points, pt],
+    }));
   };
 
   const finishStroke = () => {
@@ -367,30 +489,38 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     }
     if (!draftStroke) return;
 
-    const pts = draftStroke.points;
-    if (pts.length >= 2) {
-      const dx = pts[pts.length - 1].x - pts[0].x;
-      const dy = pts[pts.length - 1].y - pts[0].y;
+    let finalPoints = draftStroke.points;
+    if (finalPoints.length >= 2) {
+      const dx = finalPoints[finalPoints.length - 1].x - finalPoints[0].x;
+      const dy = finalPoints[finalPoints.length - 1].y - finalPoints[0].y;
       const dist = Math.hypot(dx, dy);
 
-      if (dist > 0.006) {
+      if (dist > 0.004 || finalPoints.length > 4) {
+        // Only apply beautification when "Arrumar Letra" is explicitly activated!
+        const isSmoothed =
+          draftStroke.type === 'pen' && !!draftStroke.beautify;
+        if (isSmoothed && !draftStroke.straight) {
+          finalPoints = beautifyStrokePoints(finalPoints);
+        }
+
         const snippet =
-          draftStroke.type === 'highlight' ? extractHighlightedSnippet(pts) : '';
+          draftStroke.type === 'highlight' ? extractHighlightedSnippet(finalPoints) : '';
 
         onCreateAnnotation({
           page: pageNumber,
           type: draftStroke.type,
           mode: draftStroke.mode || 'multiline',
+          smoothed: isSmoothed,
           color: draftStroke.color,
           tag: draftStroke.tag || 'Marca-texto',
           opacity: draftStroke.opacity || 0.42,
           strokeWidth: draftStroke.strokeWidth,
-          points: pts,
+          points: finalPoints,
           label:
             snippet ||
             (draftStroke.type === 'highlight'
               ? `${draftStroke.tag || 'Marcação'}`
-              : 'Anotação'),
+              : 'Escrita'),
         });
       }
     }
@@ -437,13 +567,11 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
 
       {isNearViewport ? (
         <>
-          {/* Layer 1: High-DPI PDF Canvas */}
           <canvas
             ref={canvasRef}
             className="block pointer-events-none rounded-xl"
           />
 
-          {/* Layer 2: Vector SVG Layer for Marca-texto & Caneta */}
           <svg
             viewBox="0 0 1000 1000"
             preserveAspectRatio="none"
@@ -454,9 +582,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
               const isSelected = ann.id === selectedAnnotationId;
               const isFlashing = ann.id === flashingAnnotationId;
               const strokeWidthSvg =
-                (ann.strokeWidth || (isHighlight ? 0.014 : 0.003)) * 1000;
+                (ann.strokeWidth || (isHighlight ? 0.014 : 0.0032)) * 1000;
 
-              // Check if this is a 2-point rect/multiline highlight vs freehand path
               const isBoxHighlight =
                 isHighlight &&
                 ann.mode !== 'free' &&
@@ -510,10 +637,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                       }}
                     />
 
-                    {/* Draggable Resize Handles when Selected: Shrink or Pull down to next line! */}
                     {isSelected && (
                       <>
-                        {/* Start Handle (Left / Top-Left) */}
                         <circle
                           cx={rect.p0.x * 1000}
                           cy={rect.p0.y * 1000}
@@ -527,7 +652,6 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                             setResizingHandle({ annId: ann.id, which: 'start' });
                           }}
                         />
-                        {/* End Handle (Right / Bottom-Right) */}
                         <circle
                           cx={rect.p1.x * 1000}
                           cy={rect.p1.y * 1000}
@@ -547,27 +671,30 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                 );
               }
 
+              const isStraightPen =
+                !isHighlight && ann.points && ann.points.length === 2;
+
               return (
                 <g key={ann.id}>
                   {isSelected && (
                     <path
-                      d={pointsToSvgPath(ann.points)}
+                      d={pointsToSvgPath(ann.points, !!ann.smoothed)}
                       fill="none"
                       stroke="#7C3AED"
                       strokeWidth={strokeWidthSvg + 5}
-                      strokeLinecap={isHighlight ? 'round' : 'round'}
+                      strokeLinecap="round"
                       strokeLinejoin="round"
                       opacity={0.4}
                     />
                   )}
                   <path
-                    d={pointsToSvgPath(ann.points)}
+                    d={pointsToSvgPath(ann.points, !!ann.smoothed)}
                     fill="none"
                     stroke={ann.color || '#FDE047'}
                     strokeWidth={strokeWidthSvg}
-                    strokeLinecap={isHighlight ? 'round' : 'round'}
+                    strokeLinecap="round"
                     strokeLinejoin="round"
-                    opacity={isHighlight ? ann.opacity || 0.42 : 0.92}
+                    opacity={isHighlight ? ann.opacity || 0.42 : 0.94}
                     style={{
                       mixBlendMode: isHighlight ? 'multiply' : 'normal',
                       pointerEvents: 'stroke',
@@ -588,6 +715,38 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                       }
                     }}
                   />
+
+                  {/* Endpoint handles for straight pen lines */}
+                  {isSelected && isStraightPen && (
+                    <>
+                      <circle
+                        cx={ann.points[0].x * 1000}
+                        cy={ann.points[0].y * 1000}
+                        r={6}
+                        fill="#7C3AED"
+                        stroke="#FFFFFF"
+                        strokeWidth={2}
+                        style={{ pointerEvents: 'all', cursor: 'move' }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setResizingHandle({ annId: ann.id, which: 'start' });
+                        }}
+                      />
+                      <circle
+                        cx={ann.points[1].x * 1000}
+                        cy={ann.points[1].y * 1000}
+                        r={6}
+                        fill="#7C3AED"
+                        stroke="#FFFFFF"
+                        strokeWidth={2}
+                        style={{ pointerEvents: 'all', cursor: 'move' }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setResizingHandle({ annId: ann.id, which: 'end' });
+                        }}
+                      />
+                    </>
+                  )}
                 </g>
               );
             })}
@@ -615,13 +774,13 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                 })()
               ) : (
                 <path
-                  d={pointsToSvgPath(draftStroke.points)}
+                  d={pointsToSvgPath(draftStroke.points, !!draftStroke.beautify)}
                   fill="none"
                   stroke={draftStroke.color}
                   strokeWidth={draftStroke.strokeWidth * 1000}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  opacity={draftStroke.type === 'highlight' ? 0.42 : 0.9}
+                  opacity={draftStroke.type === 'highlight' ? 0.42 : 0.92}
                   style={{
                     mixBlendMode:
                       draftStroke.type === 'highlight' ? 'multiply' : 'normal',
@@ -630,16 +789,61 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
               ))}
           </svg>
 
-          {/* Popover when a Highlight or Pen Stroke is clicked: Shrink/Grow thickness, Change color, or Delete */}
+          {/* Popover when a Highlight or Pen Stroke is clicked */}
           {selectedVector && (
             <div
               onMouseDown={(e) => e.stopPropagation()}
               style={{
-                left: `${Math.min(0.55, selectedVector.points?.[0]?.x || 0.2) * dimensions.width}px`,
+                left: `${Math.min(0.48, selectedVector.points?.[0]?.x || 0.2) * dimensions.width}px`,
                 top: `${Math.max(0.02, (selectedVector.points?.[0]?.y || 0.2) - 0.055) * dimensions.height}px`,
               }}
               className="absolute z-50 flex items-center gap-2 bg-white text-zinc-800 px-3 py-1.5 rounded-2xl shadow-float border border-violet-100 text-xs"
             >
+              {/* On-demand "Traço Reto" and "Arrumar Traço" buttons for a selected Pen stroke */}
+              {selectedVector.type === 'pen' && selectedVector.points?.length >= 2 && (
+                <div className="flex items-center gap-1 pr-1 border-r border-zinc-200">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const pts = selectedVector.points;
+                      const straightPts = snapStraightEndpoints(
+                        pts[0],
+                        pts[pts.length - 1]
+                      );
+                      onUpdateAnnotation(
+                        selectedVector.id,
+                        { points: straightPts, smoothed: false },
+                        true
+                      );
+                    }}
+                    className="flex items-center gap-1 px-2 py-1 rounded-xl bg-[#F5F4F9] hover:bg-violet-50 text-violet-900 font-medium transition"
+                    title="Transformar este traço em uma linha reta"
+                  >
+                    <Ruler className="w-3.5 h-3.5 text-violet-600" />
+                    <span>Deixar Reto</span>
+                  </button>
+
+                  {selectedVector.points.length > 2 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const smoothedPts = beautifyStrokePoints(selectedVector.points);
+                        onUpdateAnnotation(
+                          selectedVector.id,
+                          { points: smoothedPts, smoothed: true },
+                          true
+                        );
+                      }}
+                      className="flex items-center gap-1 px-2 py-1 rounded-xl bg-[#F5F4F9] hover:bg-violet-50 text-violet-900 font-medium transition"
+                      title="Suavizar e arrumar este traço"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-violet-600" />
+                      <span>Arrumar</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Shrink / Grow Thickness of this highlight */}
               {selectedVector.type === 'highlight' && (
                 <div className="flex items-center gap-1 pr-1 border-r border-zinc-200">
